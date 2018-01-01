@@ -400,18 +400,24 @@ namespace Squirrel.Update
 
                     if (signingOpts == null) return;
 
+                    string filestoSign = null;
+
                     new DirectoryInfo(pkgPath).GetAllFilesRecursively()
                         .Where(x => Utility.FileIsLikelyPEImage(x.Name))
-                        .ForEachAsync(async x => {
+                        .ForEach(x => {
                             if (isPEFileSigned(x.FullName)) {
                                 this.Log().Info("{0} is already signed, skipping", x.FullName);
                                 return;
                             }
 
                             this.Log().Info("About to sign {0}", x.FullName);
-                            await signPEFile(x.FullName, signingOpts);
-                        }, 1)
-                        .Wait();
+                            filestoSign += "\"" + x.FullName + "\" ";
+                        });
+
+                    if (!String.IsNullOrEmpty(filestoSign)) {
+                        this.Log().Info("Signing files with {1}: {0}", filestoSign, signingOpts);
+                        signPEFile(filestoSign, signingOpts, this.Log()).Wait();
+                    }
                 });
 
                 processed.Add(rp.ReleasePackageFile);
@@ -458,16 +464,23 @@ namespace Squirrel.Update
             Utility.Retry(() =>
                 setPEVersionInfoAndIcon(targetSetupExe, new ZipPackage(package), setupIcon).Wait());
 
+            string packagestoSign = null;
+
             if (signingOpts != null) {
-                signPEFile(targetSetupExe, signingOpts).Wait();
+                packagestoSign += "\"" + targetSetupExe + "\" ";
             }
 
             if (generateMsi) {
                 createMsiPackage(targetSetupExe, new ZipPackage(package)).Wait();
 
                 if (signingOpts != null) {
-                    signPEFile(targetSetupExe.Replace(".exe", ".msi"), signingOpts).Wait();
+                    packagestoSign += "\"" + targetSetupExe.Replace(".exe", ".msi") + "\" ";
                 }
+            }
+
+            if (signingOpts != null && !String.IsNullOrEmpty(packagestoSign)) {
+                this.Log().Info("Signing packages with {1}: {0}", packagestoSign, signingOpts);
+                signPEFile(packagestoSign, signingOpts, this.Log()).Wait();
             }
         }
 
@@ -611,7 +624,13 @@ namespace Squirrel.Update
                         .Where(x => x.Name.ToLowerInvariant().EndsWith(".exe"))
                         .Select(x => x.FullName);
 
-                    await files.ForEachAsync(x => signPEFile(x, signingOpts));
+                    string filestoSign = null;
+                    files.ForEach(x => filestoSign += "\"" + x + "\" ");
+
+                    if (!String.IsNullOrEmpty(filestoSign)) {
+                        this.Log().Info("Signing files with {1}: {0}", filestoSign, signingOpts);
+                        signPEFile(filestoSign, signingOpts, this.Log()).Wait();
+                    }
                 }
 
                 this.ErrorIfThrows(() =>
@@ -622,30 +641,53 @@ namespace Squirrel.Update
             }
         }
 
-        static async Task signPEFile(string exePath, string signingOpts)
+        static async Task signPEFile(string exePath, string signingOpts, IFullLogger log)
         {
-            // Try to find SignTool.exe
-            var exe = @".\signtool.exe";
-            if (!File.Exists(exe)) {
-                exe = Path.Combine(
-                    Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
-                    "signtool.exe");
+            if (signingOpts.ToLower().IndexOf(".bat") > 0)
+            {
+                var batchScript = signingOpts;
+                var processResult = await Utility.InvokeProcessAsync(batchScript, 
+                    exePath, CancellationToken.None);
 
-                // Run down PATH and hope for the best
-                if (!File.Exists(exe)) exe = "signtool.exe";
+                if (processResult.Item1 != 0) {
+                    var msg = String.Format("Failed to sign, command invoked was: '{0} {1} '", 
+                        batchScript, exePath);
+
+                    log.Info(processResult.Item2);
+                    throw new Exception(msg);
+                }
+                else {
+                    log.Info(processResult.Item2);
+                    Console.WriteLine(processResult.Item2);
+                }
             }
+            else
+            {
+                // Try to find SignTool.exe
+                var exe = @".\signtool.exe";
+                if (!File.Exists(exe)) {
+                    exe = Path.Combine(
+                        Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
+                        "signtool.exe");
 
-            var processResult = await Utility.InvokeProcessAsync(exe,
-                String.Format("sign {0} \"{1}\"", signingOpts, exePath), CancellationToken.None);
+                    // Run down PATH and hope for the best
+                    if (!File.Exists(exe)) exe = "signtool.exe";
+                }
+            
+                var processResult = await Utility.InvokeProcessAsync(exe,
+                    String.Format("sign {0} \"{1}\"", signingOpts, exePath), CancellationToken.None);
 
-            if (processResult.Item1 != 0) {
-                var optsWithPasswordHidden = new Regex(@"/p\s+\w+").Replace(signingOpts, "/p ********");
-                var msg = String.Format("Failed to sign, command invoked was: '{0} sign {1} {2}'",
-                    exe, optsWithPasswordHidden, exePath);
+                if (processResult.Item1 != 0) {
+                    var optsWithPasswordHidden = new Regex(@"/p\s+\w+").Replace(signingOpts, "/p ********");
+                    var msg = String.Format("Failed to sign, command invoked was: '{0} sign {1} {2}'",
+                        exe, optsWithPasswordHidden, exePath);
 
-                throw new Exception(msg);
-            } else {
-                Console.WriteLine(processResult.Item2);
+                    log.Info(processResult.Item2);
+                    throw new Exception(msg);
+                } else {
+                    log.Info(processResult.Item2);
+                    Console.WriteLine(processResult.Item2);
+                }
             }
         }
         bool isPEFileSigned(string path)
